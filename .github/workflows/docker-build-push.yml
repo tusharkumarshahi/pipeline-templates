@@ -1,0 +1,137 @@
+name: Reusable Docker Build and Push
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: 'Docker image name (without registry prefix)'
+        required: true
+        type: string
+      dockerfile_path:
+        description: 'Path to Dockerfile'
+        required: false
+        type: string
+        default: './Dockerfile'
+      build_context:
+        description: 'Docker build context path'
+        required: false
+        type: string
+        default: '.'
+      build_tool:
+        description: 'Build tool to use (maven, gradle, go, npm, none)'
+        required: false
+        type: string
+        default: 'maven'
+      java_version:
+        description: 'Java version for Maven/Gradle builds'
+        required: false
+        type: string
+        default: '17'
+      docker_tag_suffix:
+        description: 'Additional tag suffix (e.g., dev, prod)'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      DOCKER_USERNAME:
+        description: 'Docker Hub username'
+        required: true
+      DOCKER_TOKEN:
+        description: 'Docker Hub access token'
+        required: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # Step 1: Checkout the calling repository's code
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Step 2: Set up Java (if needed)
+      - name: Set up JDK
+        if: inputs.build_tool == 'maven' || inputs.build_tool == 'gradle'
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: 'temurin'
+      
+      # Step 3: Build with Maven
+      - name: Build with Maven
+        if: inputs.build_tool == 'maven'
+        run: mvn clean package -DskipTests
+      
+      # Step 4: Build with Gradle
+      - name: Build with Gradle
+        if: inputs.build_tool == 'gradle'
+        run: ./gradlew build -x test
+      
+      # Step 5: Set up Go (if needed)
+      - name: Set up Go
+        if: inputs.build_tool == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      
+      # Step 6: Build with Go
+      - name: Build with Go
+        if: inputs.build_tool == 'go'
+        run: go build -v ./...
+      
+      # Step 7: Set up Node.js (if needed)
+      - name: Set up Node.js
+        if: inputs.build_tool == 'npm'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      # Step 8: Build with npm
+      - name: Build with npm
+        if: inputs.build_tool == 'npm'
+        run: |
+          npm ci
+          npm run build
+      
+      # Step 9: Set up Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      # Step 10: Log in to Docker Hub
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+      
+      # Step 11: Extract metadata for Docker
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKER_USERNAME }}/${{ inputs.image_name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ inputs.docker_tag_suffix }},enable=${{ inputs.docker_tag_suffix != '' }}
+      
+      # Step 12: Build and push Docker image
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.build_context }}
+          file: ${{ inputs.dockerfile_path }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/${{ inputs.image_name }}:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/${{ inputs.image_name }}:buildcache,mode=max
+      
+      # Step 13: Output image details
+      - name: Output image details
+        run: |
+          echo "Image pushed successfully!"
+          echo "Image name: ${{ secrets.DOCKER_USERNAME }}/${{ inputs.image_name }}"
+          echo "Tags: ${{ steps.meta.outputs.tags }}"
