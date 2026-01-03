@@ -1,4 +1,4 @@
-name: Reusable Docker Build and Push
+name: Reusable Docker Build and Push (Optimized)
 
 on:
   workflow_call:
@@ -27,11 +27,61 @@ on:
         required: false
         type: string
         default: '17'
-      docker_tag_suffix:
-        description: 'Additional tag suffix (e.g., dev, prod)'
+      java_distribution:
+        description: 'Java distribution (temurin, zulu, adopt, etc.)'
+        required: false
+        type: string
+        default: 'temurin'
+      go_version:
+        description: 'Go version'
+        required: false
+        type: string
+        default: '1.21'
+      node_version:
+        description: 'Node.js version'
+        required: false
+        type: string
+        default: '20'
+      artifact_path:
+        description: 'Path pattern for build artifacts (e.g., target/*.jar, dist/app)'
         required: false
         type: string
         default: ''
+      maven_args:
+        description: 'Additional Maven arguments'
+        required: false
+        type: string
+        default: '-DskipTests'
+      gradle_args:
+        description: 'Additional Gradle arguments'
+        required: false
+        type: string
+        default: '-x test'
+      enable_cache:
+        description: 'Enable build caching'
+        required: false
+        type: boolean
+        default: true
+      enable_sbom:
+        description: 'Generate Software Bill of Materials (SBOM)'
+        required: false
+        type: boolean
+        default: false
+      enable_provenance:
+        description: 'Generate build provenance attestation'
+        required: false
+        type: boolean
+        default: false
+      platforms:
+        description: 'Target platforms (e.g., linux/amd64,linux/arm64)'
+        required: false
+        type: string
+        default: 'linux/amd64'
+      push_image:
+        description: 'Push image to registry (false for PR builds)'
+        required: false
+        type: boolean
+        default: true
     secrets:
       DOCKER_USERNAME:
         description: 'Docker Hub username'
@@ -39,99 +89,286 @@ on:
       DOCKER_TOKEN:
         description: 'Docker Hub access token'
         required: true
+    outputs:
+      image_tag:
+        description: 'The primary image tag that was pushed'
+        value: ${{ jobs.build-and-push.outputs.image_tag }}
+      image_digest:
+        description: 'The image digest'
+        value: ${{ jobs.build-and-push.outputs.image_digest }}
+      version:
+        description: 'The semantic version extracted or generated'
+        value: ${{ jobs.build-and-push.outputs.version }}
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.semver.outputs.version }}
     
     steps:
-      # Step 1: Checkout the calling repository's code
+      # ============================================
+      # STEP 1: Checkout Code
+      # ============================================
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for proper versioning
       
-      # Step 2: Set up Java (if needed)
+      # ============================================
+      # STEP 2: Extract Semantic Version
+      # ============================================
+      - name: Extract semantic version
+        id: semver
+        run: |
+          # Try to get version from git tags
+          if git describe --tags --abbrev=0 2>/dev/null; then
+            VERSION=$(git describe --tags --abbrev=0 | sed 's/^v//')
+            echo "Found git tag version: $VERSION"
+          elif [ -f "pom.xml" ]; then
+            # Extract from Maven pom.xml
+            VERSION=$(grep -m1 '<version>' pom.xml | sed 's/.*<version>\(.*\)<\/version>.*/\1/')
+            echo "Found Maven version: $VERSION"
+          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            # Extract from Gradle
+            VERSION=$(grep -m1 "version" build.gradle* | sed "s/.*version.*['\"]//;s/['\"].*//" | tr -d ' ')
+            echo "Found Gradle version: $VERSION"
+          elif [ -f "package.json" ]; then
+            # Extract from package.json
+            VERSION=$(grep -m1 '"version"' package.json | sed 's/.*"version": "\(.*\)".*/\1/')
+            echo "Found npm version: $VERSION"
+          elif [ -f "go.mod" ]; then
+            # For Go, use git info
+            VERSION="0.0.0"
+            echo "Using default Go version: $VERSION"
+          else
+            VERSION="0.0.0"
+            echo "No version found, using default: $VERSION"
+          fi
+          
+          # Add build metadata for non-main branches
+          BRANCH=${GITHUB_REF#refs/heads/}
+          SHORT_SHA=${GITHUB_SHA::8}
+          
+          if [ "$BRANCH" != "main" ] && [ "$BRANCH" != "master" ]; then
+            FULL_VERSION="${VERSION}-${BRANCH}.${SHORT_SHA}"
+          else
+            FULL_VERSION="${VERSION}+${SHORT_SHA}"
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "full_version=$FULL_VERSION" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "Final version: $FULL_VERSION"
+      
+      # ============================================
+      # STEP 3: Setup Build Environment - Java
+      # ============================================
       - name: Set up JDK
         if: inputs.build_tool == 'maven' || inputs.build_tool == 'gradle'
         uses: actions/setup-java@v4
         with:
           java-version: ${{ inputs.java_version }}
-          distribution: 'temurin'
+          distribution: ${{ inputs.java_distribution }}
+          cache: ${{ inputs.enable_cache && inputs.build_tool || '' }}
       
-      # Step 3: Build with Maven
+      # ============================================
+      # STEP 4: Build with Maven
+      # ============================================
       - name: Build with Maven
         if: inputs.build_tool == 'maven'
-        run: mvn clean package -DskipTests
+        run: |
+          echo "Building with Maven..."
+          mvn clean package ${{ inputs.maven_args }} --batch-mode --no-transfer-progress
+          
+          # Identify the JAR file
+          if [ -n "${{ inputs.artifact_path }}" ]; then
+            JAR_FILE=$(ls ${{ inputs.artifact_path }} | head -1)
+          else
+            JAR_FILE=$(find target -name "*.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" | head -1)
+          fi
+          
+          echo "JAR_FILE=$JAR_FILE" >> $GITHUB_ENV
+          echo "Found artifact: $JAR_FILE"
+          
+          # Copy to a consistent location for Docker
+          mkdir -p build-output
+          cp "$JAR_FILE" build-output/app.jar
+          ls -lh build-output/
       
-      # Step 4: Build with Gradle
+      # ============================================
+      # STEP 5: Build with Gradle
+      # ============================================
       - name: Build with Gradle
         if: inputs.build_tool == 'gradle'
-        run: ./gradlew build -x test
+        run: |
+          echo "Building with Gradle..."
+          chmod +x ./gradlew
+          ./gradlew build ${{ inputs.gradle_args }} --no-daemon
+          
+          # Identify the JAR file
+          if [ -n "${{ inputs.artifact_path }}" ]; then
+            JAR_FILE=$(ls ${{ inputs.artifact_path }} | head -1)
+          else
+            JAR_FILE=$(find build/libs -name "*.jar" ! -name "*-plain.jar" ! -name "*-sources.jar" | head -1)
+          fi
+          
+          echo "JAR_FILE=$JAR_FILE" >> $GITHUB_ENV
+          echo "Found artifact: $JAR_FILE"
+          
+          # Copy to a consistent location for Docker
+          mkdir -p build-output
+          cp "$JAR_FILE" build-output/app.jar
+          ls -lh build-output/
       
-      # Step 5: Set up Go (if needed)
+      # ============================================
+      # STEP 6: Setup Build Environment - Go
+      # ============================================
       - name: Set up Go
         if: inputs.build_tool == 'go'
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: ${{ inputs.go_version }}
+          cache: ${{ inputs.enable_cache }}
       
-      # Step 6: Build with Go
+      # ============================================
+      # STEP 7: Build with Go
+      # ============================================
       - name: Build with Go
         if: inputs.build_tool == 'go'
-        run: go build -v ./...
+        run: |
+          echo "Building with Go..."
+          go build -v -o build-output/app ./...
+          ls -lh build-output/
       
-      # Step 7: Set up Node.js (if needed)
+      # ============================================
+      # STEP 8: Setup Build Environment - Node.js
+      # ============================================
       - name: Set up Node.js
         if: inputs.build_tool == 'npm'
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ inputs.node_version }}
+          cache: ${{ inputs.enable_cache && 'npm' || '' }}
       
-      # Step 8: Build with npm
+      # ============================================
+      # STEP 9: Build with npm
+      # ============================================
       - name: Build with npm
         if: inputs.build_tool == 'npm'
         run: |
+          echo "Building with npm..."
           npm ci
           npm run build
+          
+          # Copy build output to consistent location
+          mkdir -p build-output
+          if [ -d "dist" ]; then
+            cp -r dist/* build-output/
+          elif [ -d "build" ]; then
+            cp -r build/* build-output/
+          fi
+          ls -lh build-output/
       
-      # Step 9: Set up Docker Buildx
+      # ============================================
+      # STEP 10: Set up QEMU (for multi-platform)
+      # ============================================
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      # ============================================
+      # STEP 11: Set up Docker Buildx
+      # ============================================
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
       
-      # Step 10: Log in to Docker Hub
+      # ============================================
+      # STEP 12: Log in to Docker Hub
+      # ============================================
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
       
-      # Step 11: Extract metadata for Docker
+      # ============================================
+      # STEP 13: Extract Docker metadata
+      # ============================================
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ secrets.DOCKER_USERNAME }}/${{ inputs.image_name }}
           tags: |
+            # Semantic version tags
+            type=semver,pattern={{version}},value=${{ steps.semver.outputs.full_version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.semver.outputs.version }}
+            type=semver,pattern={{major}},value=${{ steps.semver.outputs.version }}
+            # Branch-based tags
             type=ref,event=branch
-            type=ref,event=pr
-            type=sha,prefix={{branch}}-
+            type=ref,event=pr,prefix=pr-
+            # SHA-based tag
+            type=sha,prefix={{branch}}-,format=short
+            # Latest tag (only on main/master)
             type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=${{ inputs.docker_tag_suffix }},enable=${{ inputs.docker_tag_suffix != '' }}
+          labels: |
+            org.opencontainers.image.title=${{ inputs.image_name }}
+            org.opencontainers.image.description=Built with reusable CI/CD pipeline
+            org.opencontainers.image.version=${{ steps.semver.outputs.full_version }}
       
-      # Step 12: Build and push Docker image
+      # ============================================
+      # STEP 14: Build and push Docker image
+      # ============================================
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: ${{ inputs.build_context }}
           file: ${{ inputs.dockerfile_path }}
-          push: true
+          platforms: ${{ inputs.platforms }}
+          push: ${{ inputs.push_image }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/${{ inputs.image_name }}:buildcache
           cache-to: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/${{ inputs.image_name }}:buildcache,mode=max
+          sbom: ${{ inputs.enable_sbom }}
+          provenance: ${{ inputs.enable_provenance }}
       
-      # Step 13: Output image details
-      - name: Output image details
+      # ============================================
+      # STEP 15: Generate build summary
+      # ============================================
+      - name: Generate build summary
         run: |
-          echo "Image pushed successfully!"
-          echo "Image name: ${{ secrets.DOCKER_USERNAME }}/${{ inputs.image_name }}"
-          echo "Tags: ${{ steps.meta.outputs.tags }}"
+          echo "## 🚀 Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Build Information" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: \`${{ steps.semver.outputs.full_version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: \`${{ steps.semver.outputs.short_sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Tool**: \`${{ inputs.build_tool }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Platforms**: \`${{ inputs.platforms }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🐳 Docker Image" >> $GITHUB_STEP_SUMMARY
+          echo "- **Registry**: Docker Hub" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository**: \`${{ secrets.DOCKER_USERNAME }}/${{ inputs.image_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Digest**: \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🏷️ Image Tags" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.push_image }}" = "true" ]; then
+            echo "### 📥 Pull Command" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+            echo "docker pull ${{ secrets.DOCKER_USERNAME }}/${{ inputs.image_name }}:${{ steps.semver.outputs.full_version }}" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ℹ️ Note" >> $GITHUB_STEP_SUMMARY
+            echo "Image was built but not pushed (PR build)" >> $GITHUB_STEP_SUMMARY
+          fi
