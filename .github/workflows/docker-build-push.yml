@@ -157,7 +157,6 @@ jobs:
             type=raw,value=${{ steps.version.outputs.version }}
             type=raw,value=${{ steps.version.outputs.full_version }}
             type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix={{branch}}-
 
       # ===================================
       # STEP 7: Build and Push
